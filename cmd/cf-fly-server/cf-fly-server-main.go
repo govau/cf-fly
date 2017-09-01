@@ -8,15 +8,20 @@ import (
 	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"log"
 	"math/big"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"time"
 
 	cfclient "github.com/cloudfoundry-community/go-cfclient"
+	jwt "github.com/dgrijalva/jwt-go"
 	"github.com/gorilla/mux"
+	cfcommon "github.com/govau/cf-common"
 	cffly "github.com/govau/cf-fly"
 )
 
@@ -27,11 +32,13 @@ type ttlBytes struct {
 }
 
 type cfFlyServer struct {
-	CFAPIURL       string // e.g. https://api.system.example.com
-	UAAAPIClientID string // as configured in UAA
-	JWTValidator   cffly.JWTValidator
+	CFAPIURL        string // e.g. https://api.system.example.com
+	UAAAPIClientID  string // as configured in UAA
+	AudienceToStamp string // put into tokens
 
 	// Internal
+	uaaClient *cfcommon.UAAClient
+
 	keyLock sync.RWMutex
 
 	// current key
@@ -48,20 +55,52 @@ type cfFlyServer struct {
 
 // Init must be called at server start
 func (s *cfFlyServer) Init() error {
-	return s.rotateSigningKey()
+	var err error
+	s.uaaClient, err = cfcommon.NewUAAClientFromAPIURL(s.CFAPIURL)
+	if err != nil {
+		return err
+	}
+	err = s.rotateSigningKey(time.Now().Add(time.Hour * 24))
+	if err != nil {
+		return err
+	}
+
+	return nil
 }
 
-// generate a new key for signing, discard old ones
-func (s *cfFlyServer) rotateSigningKey() error {
+func (s *cfFlyServer) getCurrentKey(desiredTTL time.Time) (*rsa.PrivateKey, string, error) {
+	for i := 0; i < 2; i++ {
+		s.keyLock.RLock()
+		k := s.curPrivateKey
+		t := s.currentTTL
+		i := s.currentKeyID
+		s.keyLock.RUnlock()
+
+		// Make sure we're good for at least an hour
+		if t.After(desiredTTL) {
+			return k, i, nil
+		}
+
+		err := s.rotateSigningKey(desiredTTL)
+		if err != nil {
+			return nil, "", err
+		}
+	}
+	return nil, "", errors.New("took too long")
+}
+
+// generate a new key for signing, discard old ones. New one will be valid at least the length of the desired
+func (s *cfFlyServer) rotateSigningKey(desiredTTL time.Time) error {
 	newKey, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
 		return err
 	}
 
-	n := time.Now()
+	// give a bit of slop
+	now := time.Now().Add(-5 * time.Minute)
 
-	nvb := n.Add(-5 * time.Minute) // give a bit of slop
-	nva := nvb.Add(24 * time.Hour)
+	nvb := now
+	nva := desiredTTL.Add(1 * time.Hour)
 
 	cert := &x509.Certificate{
 		SerialNumber: big.NewInt(1),
@@ -90,7 +129,7 @@ func (s *cfFlyServer) rotateSigningKey() error {
 	var newAll []*ttlBytes
 	toSerial := make(cffly.CertificateMap)
 	for _, thing := range append(s.allKeys, &ttlBytes{Bytes: certBytes, TTL: nva, KeyID: newKeyID}) {
-		if thing.TTL.After(n) {
+		if thing.TTL.After(now) {
 			newAll = append(newAll, thing)
 			toSerial[thing.KeyID] = thing.Bytes
 		}
@@ -127,28 +166,112 @@ func (s *cfFlyServer) signHandler(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
+	at := parts[1]
 
 	// First make sure it was intended for us
-	_, err := s.JWTValidator.ValidateAccessToken(t, s.UAAAPIClientID)
+	og, err := s.uaaClient.ValidateAccessToken(at, s.UAAAPIClientID)
 	if err != nil {
 		w.WriteHeader(http.StatusForbidden)
 		return
 	}
 
-	// Next extract the user_id from /userinfo -> {
-	//"user_id" : "xxxx",
-
-	// Then see if we are a SpaceDeveloper
-	// cli.ListUserSpaces(uuid)
-
-	//spaceUUID := r.FormValue("space")
-
-	cli := &cfclient.Config{
-		ApiAddress: s.CFAPIURL,
+	userID, _ := og["user_id"].(string)
+	if userID == "" {
+		w.WriteHeader(http.StatusForbidden)
+		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	//w.Write(v)
+	email, _ := og["email"].(string)
+	if email == "" {
+		w.WriteHeader(http.StatusForbidden)
+		return
+	}
+
+	spaceID := r.FormValue("space")
+	if spaceID == "" {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+
+	cli, err := cfclient.NewClient(&cfclient.Config{
+		ApiAddress: s.CFAPIURL,
+		Token:      at,
+	})
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	space, err := cli.GetSpaceByGuid(spaceID)
+	if err != nil {
+		w.WriteHeader(http.StatusForbidden)
+		return
+	}
+
+	roles, err := space.Roles()
+	if err != nil {
+		w.WriteHeader(http.StatusForbidden)
+		return
+	}
+
+	allowed := false
+	for _, sr := range roles {
+		if sr.Guid == userID {
+			for _, r := range sr.SpaceRoles {
+				if r == "space_developer" {
+					allowed = true
+					break
+				}
+			}
+		}
+	}
+	if !allowed {
+		w.WriteHeader(http.StatusForbidden)
+		return
+	}
+
+	org, err := space.Org()
+	if err != nil {
+		w.WriteHeader(http.StatusForbidden)
+		return
+	}
+
+	ttl := time.Now().Add(4 * time.Hour)
+	pkey, keyID, err := s.getCurrentKey(ttl)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	jwtToken := jwt.NewWithClaims(jwt.SigningMethodRS256, jwt.MapClaims{
+		// Concourse normal claims
+		"exp":      ttl.Unix(),
+		"teamName": makeTeamName(org.Name, space.Name),
+		"isAdmin":  false,
+		"csrf":     "",
+
+		// Our own
+		"kid":              keyID,             // to find which key to verify against
+		"aud":              s.AudienceToStamp, // in case the same server matches multiple Concourses
+		"createIfNotExist": true,              // create the team if it doesn't exist
+		"emailAddress":     email,             // for audit logging
+	})
+
+	signed, err := jwtToken.SignedString(pkey)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	log.Printf("Signed token for %s in team: %s / %s\n", email, org.Name, space.Name)
+
+	w.Header().Set("Content-Type", "text/plain")
+	w.Write([]byte(signed))
+}
+
+func makeTeamName(org, space string) string {
+	// TODO fix security bug whereby someone could cheat
+	return fmt.Sprintf("%s-%s", org, space)
 }
 
 func (s *cfFlyServer) CreateHandler() http.Handler {
@@ -159,10 +282,15 @@ func (s *cfFlyServer) CreateHandler() http.Handler {
 }
 
 func main() {
-	server := &cfFlyServer{}
+	server := &cfFlyServer{
+		CFAPIURL:        os.Getenv("CF_API"),
+		UAAAPIClientID:  "cf-concourse-integration",
+		AudienceToStamp: "concourse",
+	}
 	err := server.Init()
 	if err != nil {
 		log.Fatal(err)
 	}
-	http.ListenAndServe(":8090", server.CreateHandler())
+	log.Println("Serving...")
+	http.ListenAndServe(":"+os.Getenv("PORT"), server.CreateHandler())
 }
