@@ -118,7 +118,7 @@ func (c *cfFly) Run(cliConnection plugin.CliConnection, args []string) {
 			API:      c.ConcourseServer,
 			TeamName: teamNameInToken,
 			Token: &rc.TargetToken{
-				Type:  "bearer",
+				Type:  "EXTERNAL",
 				Value: token,
 			},
 		})

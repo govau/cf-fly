@@ -243,10 +243,13 @@ func (s *cfFlyServer) signHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	displayName := fmt.Sprintf("Org: %s / Space: %s", org.Name, space.Name)
+	storeName := fmt.Sprintf("cf:%s", space.Guid)
+
 	jwtToken := jwt.NewWithClaims(jwt.SigningMethodRS256, jwt.MapClaims{
 		// Concourse normal claims
 		"exp":      ttl.Unix(),
-		"teamName": makeTeamName(org.Name, space.Name),
+		"teamName": storeName,
 		"isAdmin":  false,
 		"csrf":     "",
 
@@ -255,6 +258,7 @@ func (s *cfFlyServer) signHandler(w http.ResponseWriter, r *http.Request) {
 		"aud":              s.AudienceToStamp, // in case the same server matches multiple Concourses
 		"createIfNotExist": true,              // create the team if it doesn't exist
 		"emailAddress":     email,             // for audit logging
+		"displayTeamName":  displayName,
 	})
 
 	signed, err := jwtToken.SignedString(pkey)
@@ -267,11 +271,6 @@ func (s *cfFlyServer) signHandler(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "text/plain")
 	w.Write([]byte(signed))
-}
-
-func makeTeamName(org, space string) string {
-	// TODO fix security bug whereby someone could cheat
-	return fmt.Sprintf("%s-%s", org, space)
 }
 
 func (s *cfFlyServer) CreateHandler() http.Handler {
