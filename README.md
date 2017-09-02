@@ -12,6 +12,15 @@ uaac client add cf-concourse-integration \
     --access_token_validity "3600" \
     --secret "notasecret" \
     --autoapprove true
+
+# Need openid for username, and cloud_controller.read for organizations
+uaac client add cf-concourse-web-integration \
+    --name "cf-concourse-web-integration" \
+    --scope "openid cloud_controller.read" \
+    --authorized_grant_types "authorization_code" \
+    --redirect_uri "http://localhost:8090/v1/callback" \
+    --access_token_validity "3600" \
+    --secret "s3cr3t"
 ```
 
 Build custom `fly`:
@@ -50,7 +59,14 @@ git checkout addjwk
 Run the stamper:
 
 ```bash
-PORT=8090 CF_API=https://api.system.${ENV_DOMAIN} cf-fly-server
+OUR_URL=http://localhost:8090 \
+CONCOURSE_CALLBACK_URL=http://127.0.0.1:8080/auth/external/callback \
+CONCOURSE_CLIENT_SECRET=secret \
+CONCOURSE_CLIENT_ID=concourse \
+UAA_WEB_CLIENT_SECRET=s3cr3t \
+PORT=8090 \
+CF_API=https://api.system.${ENV_DOMAIN} \
+    cf-fly-server
 ```
 
 Run `atc`:
@@ -61,8 +77,9 @@ go run cmd/atc/*.go \
   --postgres-password=mysecretpassword \
   --basic-auth-username=foo \
   --basic-auth-password=bar \
-  --external-sso-key-url=http://localhost:8090/v1/keys \
-  --external-sso-audience=concourse \
+  --external-sso-url=http://localhost:8090 \
+  --external-sso-client-id=concourse \
+  --external-sso-client-secret=secret \
   --log-level debug
 ```
 
