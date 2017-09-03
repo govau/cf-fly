@@ -33,6 +33,14 @@ func (c *cfFly) getConcourseToken(cliConnection plugin.CliConnection, spaceID st
 		return "", err
 	}
 
+	if c.ConcourseServer == "" {
+		c.ConcourseServer = strings.Replace(apiEndpoint, "api.system", "concourse", 1)
+	}
+
+	if c.TokenServer == "" {
+		c.TokenServer = strings.Replace(apiEndpoint, "api.system", "cf.system", 1)
+	}
+
 	uaaClient, err := cfcommon.NewUAAClientFromAPIURL(apiEndpoint)
 	if err != nil {
 		return "", err
@@ -166,9 +174,7 @@ func (c *cfFly) GetMetadata() plugin.PluginMetadata {
 
 func main() {
 	plugin.Start(&cfFly{
-		ClientID:        "cf-concourse-integration",
-		ClientSecret:    "notasecret",
-		TokenServer:     "http://localhost:8090",
-		ConcourseServer: "http://localhost:8080",
+		ClientID:     "cf-concourse-integration",
+		ClientSecret: "notasecret",
 	})
 }
